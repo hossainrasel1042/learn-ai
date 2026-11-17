@@ -1,0 +1,208 @@
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    container_name: seaweedfs
+    restart: unless-stopped
+    command: ["server", "-dir=/data", "-s3"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+      SEAWEEDFS_JWT_SIGNING_KEY: ${SEAWEEDFS_JWT_SIGNING_KEY:?SEAWEEDFS_JWT_SIGNING_KEY is required - set it in backend/.env or the shell}
+      WEED_JWT_FILER_SIGNING_KEY: ${SEAWEEDFS_JWT_SIGNING_KEY:?SEAWEEDFS_JWT_SIGNING_KEY is required - set it in backend/.env or the shell}
+      WEED_JWT_SIGNING_KEY: ${SEAWEEDFS_JWT_SIGNING_KEY:?SEAWEEDFS_JWT_SIGNING_KEY is required - set it in backend/.env or the shell}
+    ports:
+      - "9000:8333"
+      - "8888:9333"
+      - "8889:8888"
+    volumes:
+      - minio_data:/data
+      - ./seaweedfs/healthcheck.sh:/usr/local/bin/healthcheck.sh:ro
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: chroma
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/data
+      - ./chroma/healthcheck.sh:/usr/local/bin/healthcheck.sh:ro
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: backend
+    restart: unless-stopped
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      - ENVIRONMENT=production
+      - LOG_FORMAT=json
+      - BACKEND_PUBLIC_URL=http://localhost:8000
+      - WORKER_INPROCESS=false
+      - MINIO_ENDPOINT=seaweedfs
+      - MINIO_PORT=8333
+      - MINIO_PUBLIC_ENDPOINT=http://localhost:9000
+      - REDIS_URL=redis://redis:6379/0
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - RESEND_API_URL=${RESEND_API_URL:-https://api.resend.com/emails}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-}
+      - ADMIN_PASS=${ADMIN_PASS:-}
+      - ADMIN_NAME=${ADMIN_NAME:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_contents:/app/contents
+      - backend_data:/app/data
+      - backend_logs:/app/logs
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  upload-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: upload-worker
+    restart: unless-stopped
+    command: ["node", "src/worker.js"]
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      - ENVIRONMENT=production
+      - LOG_FORMAT=json
+      - WORKER_INPROCESS=false
+      - MINIO_ENDPOINT=seaweedfs
+      - MINIO_PORT=8333
+      - MINIO_PUBLIC_ENDPOINT=http://localhost:9000
+      - REDIS_URL=redis://redis:6379/0
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+    depends_on:
+      redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+    volumes:
+      - backend_logs:/app/logs
+    networks:
+      - app-network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'cat /proc/1/cmdline 2>/dev/null | tr "\0" " " | grep -q "src/worker.js"'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        BACKEND_PROXY_ORIGIN: http://backend:8000
+    container_name: frontend
+    restart: unless-stopped
+    env_file:
+      - path: frontend/.env
+        required: false
+    environment:
+      - NODE_ENV=production
+      - BACKEND_PROXY_ORIGIN=http://backend:8000
+      - NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+
+networks:
+  app-network:
+    driver: bridge
+    name: app-network
+
+
+volumes:
+  redis_data:
+    driver: local
+    name: redis-data
+  minio_data:
+    driver: local
+    name: seaweed-data
+  chroma_data:
+    driver: local
+    name: chroma-data
+  backend_contents:
+    driver: local
+    name: backend-contents
+  backend_data:
+    driver: local
+    name: backend-data
+  backend_logs:
+    driver: local
+    name: backend-logs
